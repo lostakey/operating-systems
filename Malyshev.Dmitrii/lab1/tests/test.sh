@@ -52,9 +52,23 @@ printf 'folder = /var/log\n' > "$WORK/bad.conf"
 check "слежение за /var/log запрещено (защита от цикла)" test $? -ne 0
 check "демон не запустился при ошибках" test ! -e "$PIDFILE"
 
-echo "== Запуск демона (конфиг указан относительным путём)"
 mkdir -p "$WORK/a" "$WORK/b" "$WORK/c"
 printf 'folder = a\nfolder = b\nrecursive = yes\n' > "$WORK/test.conf"
+
+echo "== Некорректное содержимое pid-файла (не должно приводить к аварии)"
+for junk in "99999999999999999999999999999999" "-5" "abc" "0" "4294967296"; do
+    echo "$junk" > "$PIDFILE"
+    ( cd "$WORK" && "$BIN" test.conf )
+    code=$?
+    check "pid-файл '$junk': демон стартует (код $code), без SIGABRT" \
+        bash -c "[ $code -eq 0 ] && true"
+    check "pid-файл '$junk': демон работает и записал свой pid" wait_for 5 pidfile_alive
+    [ -s "$PIDFILE" ] && kill -TERM "$(cat "$PIDFILE")" 2>/dev/null
+    wait_for 5 pidfile_gone
+done
+rm -f "$PIDFILE"
+
+echo "== Запуск демона (конфиг указан относительным путём)"
 ( cd "$WORK" && "$BIN" test.conf )
 check "pid-файл создан и процесс жив" wait_for 5 pidfile_alive
 PID1=$(cat "$PIDFILE")
@@ -94,6 +108,46 @@ if [ "$HAVE_LOG" -eq 1 ]; then
     check "папка вне конфига не отслеживается" log_hasnot "${RUN}_notwatched"
 else
     skip "проверки событий (нужен журнал)"
+fi
+
+echo "== Перенос подпапок"
+if [ "$HAVE_LOG" -eq 1 ]; then
+    mkdir -p "$WORK/a/${RUN}_mv/inner"
+    sleep 0.3
+    mv "$WORK/a/${RUN}_mv" "$WORK/out_${RUN}"
+    logged "MOVED_FROM dir $WORK/a/${RUN}_mv"
+    sleep 0.5
+    echo q > "$WORK/out_${RUN}/${RUN}_after_out.txt"
+    echo q > "$WORK/out_${RUN}/inner/${RUN}_after_out_inner.txt"
+    sleep 1
+    check "запись в перенесённой наружу подпапке не логируется"       log_hasnot "${RUN}_after_out.txt"
+    check "запись в её вложенной подпапке не логируется"              log_hasnot "${RUN}_after_out_inner.txt"
+    check "снятие наблюдения отражено в служебном журнале"            logged "stopped watching $WORK/a/${RUN}_mv"
+
+    mkdir "$WORK/a/${RUN}_ren1"
+    sleep 0.3
+    mv "$WORK/a/${RUN}_ren1" "$WORK/a/${RUN}_ren2"
+    logged "MOVED_TO dir $WORK/a/${RUN}_ren2"
+    sleep 0.5
+    echo r > "$WORK/a/${RUN}_ren2/${RUN}_in_ren.txt"
+    check "после переименования события под новым путём"              logged "CREATE file $WORK/a/${RUN}_ren2/${RUN}_in_ren.txt"
+    check "под старым путём событий нет"                              log_hasnot "$WORK/a/${RUN}_ren1/${RUN}_in_ren.txt"
+
+    mv "$WORK/a/${RUN}_ren2" "$WORK/b/${RUN}_ren3"
+    logged "MOVED_TO dir $WORK/b/${RUN}_ren3"
+    sleep 0.5
+    echo s > "$WORK/b/${RUN}_ren3/${RUN}_in_b.txt"
+    check "после переноса a -> b события под путём в b"               logged "CREATE file $WORK/b/${RUN}_ren3/${RUN}_in_b.txt"
+    check "наблюдение не потеряно при переносе внутри конфига"        wait_for 3 alive "$PID1"
+
+    mv "$WORK/out_${RUN}" "$WORK/a/${RUN}_back"
+    logged "MOVED_TO dir $WORK/a/${RUN}_back"
+    sleep 0.5
+    echo t > "$WORK/a/${RUN}_back/inner/${RUN}_back_inner.txt"
+    check "подпапка, перенесённая внутрь, снова отслеживается (с вложенными)" \
+          logged "CREATE file $WORK/a/${RUN}_back/inner/${RUN}_back_inner.txt"
+else
+    skip "проверки переноса подпапок (нужен журнал)"
 fi
 
 echo "== SIGHUP: перечитывание конфига (демон уже сменил рабочий каталог на /)"

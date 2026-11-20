@@ -1,6 +1,7 @@
 #pragma once
 
 #include <csignal>
+#include <cstdint>
 #include <filesystem>
 #include <map>
 #include <string>
@@ -33,6 +34,8 @@ private:
     void closeWatches();
     void addWatchTree(const std::filesystem::path& root);
     void addWatch(const std::filesystem::path& dir);
+    void dropWatches(const std::filesystem::path& root);
+    void flushPendingMoves();
     void readEvents();
     void handleEvent(const struct inotify_event& ev);
 
@@ -44,6 +47,7 @@ private:
 
     int inotifyFd_ = -1;
     std::map<int, std::filesystem::path> watches_;
+    std::map<uint32_t, std::filesystem::path> pendingMoves_;
 
     static volatile std::sig_atomic_t gotTerm_;
     static volatile std::sig_atomic_t gotHup_;

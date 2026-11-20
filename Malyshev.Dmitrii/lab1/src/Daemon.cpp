@@ -15,6 +15,7 @@
 #include <ctime>
 #include <fstream>
 #include <iostream>
+#include <limits>
 
 namespace fs = std::filesystem;
 
@@ -68,6 +69,18 @@ bool isInside(const fs::path& child, const fs::path& parent) {
     return true;
 }
 
+bool parsePid(const std::string& s, pid_t& out) {
+    if (s.empty() || s.find_first_not_of("0123456789") != std::string::npos) return false;
+    long long value = 0;
+    for (const char ch : s) {
+        value = value * 10 + (ch - '0');
+        if (value > std::numeric_limits<pid_t>::max()) return false;  // переполнение
+    }
+    if (value <= 0) return false;
+    out = static_cast<pid_t>(value);
+    return true;
+}
+
 const uint32_t kWatchMask = IN_ACCESS | IN_MODIFY | IN_ATTRIB | IN_OPEN | IN_CLOSE_WRITE |
                             IN_CLOSE_NOWRITE | IN_CREATE | IN_DELETE | IN_MOVED_FROM |
                             IN_MOVED_TO | IN_DELETE_SELF | IN_MOVE_SELF;
@@ -89,7 +102,6 @@ const char* eventName(uint32_t m) {
 }
 
 }
-
 volatile std::sig_atomic_t Daemon::gotTerm_ = 0;
 volatile std::sig_atomic_t Daemon::gotHup_ = 0;
 
@@ -167,7 +179,6 @@ bool Daemon::loadConfig(std::string& error) {
             error = "'" + canon.string() + "' is not a directory";
             return false;
         }
-        // Журнал пишется в /var/log: слежение за ним породило бы бесконечный цикл.
         if (isInside(fs::path(kSystemLogDir), canon) && (recursive || canon == kSystemLogDir)) {
             error = "'" + canon.string() + "' contains the system log directory, refusing";
             return false;
@@ -186,10 +197,14 @@ bool Daemon::loadConfig(std::string& error) {
 
 bool Daemon::stopPreviousInstance() {
     const std::string content = readFirstLine(kPidFile);
-    if (content.empty() || content.find_first_not_of("0123456789") != std::string::npos) return true;
+    if (content.empty()) return true;
 
-    const pid_t old = static_cast<pid_t>(std::stol(content));
-    if (old <= 0 || old == getpid()) return true;
+    pid_t old = 0;
+    if (!parsePid(content, old)) {
+        logInfo("pid file contains invalid data, ignoring it");
+        return true;
+    }
+    if (old == getpid()) return true;
 
     if (!processAlive(old)) {
         logInfo("stale pid file (process " + content + " is not running)");
@@ -266,10 +281,31 @@ void Daemon::setupSignals() {
     sigaction(SIGTERM, &sa, nullptr);
 }
 
+
 void Daemon::closeWatches() {
     if (inotifyFd_ >= 0) close(inotifyFd_);
     inotifyFd_ = -1;
     watches_.clear();
+    pendingMoves_.clear();
+}
+
+void Daemon::dropWatches(const fs::path& root) {
+    for (auto it = watches_.begin(); it != watches_.end();) {
+        if (isInside(it->second, root)) {
+            inotify_rm_watch(inotifyFd_, it->first);
+            it = watches_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void Daemon::flushPendingMoves() {
+    for (const auto& kv : pendingMoves_) {
+        dropWatches(kv.second);
+        logInfo("stopped watching " + kv.second.string() + " (moved out of the watched tree)");
+    }
+    pendingMoves_.clear();
 }
 
 void Daemon::addWatch(const fs::path& dir) {
@@ -332,7 +368,18 @@ void Daemon::handleEvent(const struct inotify_event& ev) {
 
     logDiskEvent(std::string(eventName(ev.mask)) + " " + (isDir ? "dir " : "file ") + path.string());
 
-    if (recursive_ && isDir && (ev.mask & (IN_CREATE | IN_MOVED_TO))) addWatchTree(path);
+    if (!recursive_) return;
+
+    if (isDir && (ev.mask & IN_MOVED_FROM)) {
+        pendingMoves_[ev.cookie] = path;
+    } else if (isDir && (ev.mask & (IN_CREATE | IN_MOVED_TO))) {
+        if (ev.mask & IN_MOVED_TO) pendingMoves_.erase(ev.cookie);
+        addWatchTree(path);
+    } else if ((ev.mask & IN_MOVE_SELF) && ev.len == 0 &&
+               std::find(folders_.begin(), folders_.end(), path) != folders_.end()) {
+        dropWatches(path);
+        logInfo("stopped watching " + path.string() + " (configured folder was moved)");
+    }
 }
 
 void Daemon::readEvents() {
@@ -350,6 +397,7 @@ void Daemon::readEvents() {
             p += sizeof(struct inotify_event) + ev->len;
         }
     }
+    flushPendingMoves();
 }
 
 void Daemon::mainLoop() {
